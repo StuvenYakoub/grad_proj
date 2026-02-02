@@ -75,6 +75,8 @@ src/saved_tracks_best/
 src/eval_results.txt
 src/CMGAN_epoch_0_0.107
 src/CMGAN_epoch_9_0.107.pt
+src/saved_model_normal b_size1/
+src/best_ckpt/ckpt_epoch_0.pt
 AudioSamples/
 Visualizations/
 Figures/

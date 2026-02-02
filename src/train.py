@@ -14,22 +14,19 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--epochs", type=int, default=1, help="number of epochs of training")
-parser.add_argument("--batch_size", type=int, default=1)
-parser.add_argument("--log_interval", type=int, default=1)
+parser.add_argument("--epochs", type=int, default=120, help="number of epochs of training")
+parser.add_argument("--batch_size", type=int, default=4)
+parser.add_argument("--log_interval", type=int, default=500)
 parser.add_argument("--decay_epoch", type=int, default=30, help="epoch from which to start lr decay")
 parser.add_argument("--init_lr", type=float, default=5e-4, help="initial learning rate")
 parser.add_argument("--cut_len", type=int, default=16000*2, help="cut length, default is 2 seconds in denoise "
                                                                  "and dereverberation")
-parser.add_argument("--data_dir", type=str, default='../VCTK-DEMAND',
-                    help="../")
-parser.add_argument("--save_model_dir", type=str, default='./saved_model_normal',
+parser.add_argument("--data_dir", type=str, default='dir to VCTK-DEMAND dataset',
+                    help="dir of VCTK+DEMAND dataset")
+parser.add_argument("--save_model_dir", type=str, default='./saved_model',
                     help="dir of saved model")
 parser.add_argument("--loss_weights", type=list, default=[0.1, 0.9, 0.2, 0.05],
                     help="weights of RI components, magnitude, time loss, and Metric Disc")
-parser.add_argument("--resume", type=str, default=None, help="path to a full checkpoint .pt to resume from")
-parser.add_argument("--start_epoch", type=int, default=0, help="manually set starting epoch (optional)")
-
 args = parser.parse_args()
 logging.basicConfig(level=logging.INFO)
 
@@ -72,32 +69,6 @@ class Trainer:
         self.discriminator = DDP(self.discriminator, device_ids=[gpu_id])
         self.gpu_id = gpu_id
 
-    def load_checkpoint(self, ckpt_path, scheduler_G=None, scheduler_D=None):
-        ckpt = torch.load(ckpt_path, map_location="cpu")
-
-        self.model.module.load_state_dict(ckpt["model"])
-        self.discriminator.module.load_state_dict(ckpt["discriminator"])
-
-        self.optimizer.load_state_dict(ckpt["optimizer"])
-        self.optimizer_disc.load_state_dict(ckpt["optimizer_disc"])
-
-        device = torch.device(f"cuda:{self.gpu_id}")
-        self._optimizer_to_device(self.optimizer, device)
-        self._optimizer_to_device(self.optimizer_disc, device)
-
-        if scheduler_G is not None and "scheduler_G" in ckpt:
-            scheduler_G.load_state_dict(ckpt["scheduler_G"])
-        if scheduler_D is not None and "scheduler_D" in ckpt:
-            scheduler_D.load_state_dict(ckpt["scheduler_D"])
-
-        return ckpt.get("epoch", -1)
-    
-    def _optimizer_to_device(self, optimizer, device):
-        for state in optimizer.state.values():
-            for k, v in state.items():
-                if torch.is_tensor(v):
-                    state[k] = v.to(device)
-
     def forward_generator_step(self, clean, noisy):
 
         # Normalization
@@ -113,7 +84,6 @@ class Trainer:
             self.hop,
             window=torch.hamming_window(self.n_fft).to(self.gpu_id),
             onesided=True,
-            return_complex=False,
         )
         clean_spec = torch.stft(
             clean,
@@ -121,13 +91,7 @@ class Trainer:
             self.hop,
             window=torch.hamming_window(self.n_fft).to(self.gpu_id),
             onesided=True,
-            return_complex=False,
         )
-        if torch.is_complex(noisy_spec):
-            noisy_spec = torch.view_as_real(noisy_spec)  # -> (..., 2)
-        if torch.is_complex(clean_spec):
-            clean_spec = torch.view_as_real(clean_spec)  # -> (..., 2)
-
         noisy_spec = power_compress(noisy_spec).permute(0, 1, 3, 2)
         clean_spec = power_compress(clean_spec)
         clean_real = clean_spec[:, 0, :, :].unsqueeze(1)
@@ -138,11 +102,9 @@ class Trainer:
         est_mag = torch.sqrt(est_real**2 + est_imag**2)
         clean_mag = torch.sqrt(clean_real**2 + clean_imag**2)
 
-        est_spec_ri = power_uncompress(est_real, est_imag).squeeze(1)  # expected: [B, F, T, 2]
-        est_spec_complex = torch.view_as_complex(est_spec_ri.contiguous())
-
+        est_spec_uncompress = power_uncompress(est_real, est_imag).squeeze(1)
         est_audio = torch.istft(
-            est_spec_complex,
+            est_spec_uncompress,
             self.n_fft,
             self.hop,
             window=torch.hamming_window(self.n_fft).to(self.gpu_id),
@@ -289,16 +251,7 @@ class Trainer:
         scheduler_D = torch.optim.lr_scheduler.StepLR(
             self.optimizer_disc, step_size=args.decay_epoch, gamma=0.5
         )
-
-        start_epoch = args.start_epoch
-
-        if args.resume is not None:
-            last_epoch = self.load_checkpoint(args.resume, scheduler_G, scheduler_D)
-            start_epoch = last_epoch + 1  # continue from next epoch
-            if self.gpu_id == 0:
-                logging.info(f"Resumed from {args.resume} at epoch {last_epoch}, starting epoch {start_epoch}")
-
-        for epoch in range(start_epoch, args.epochs):
+        for epoch in range(args.epochs):
             self.model.train()
             self.discriminator.train()
             for idx, batch in enumerate(self.train_ds):
@@ -317,19 +270,7 @@ class Trainer:
             if not os.path.exists(args.save_model_dir):
                 os.makedirs(args.save_model_dir)
             if self.gpu_id == 0:
-                os.makedirs(args.save_model_dir, exist_ok=True)
-                ckpt_path = os.path.join(args.save_model_dir, f"ckpt_epoch_{epoch}.pt")
-
-                ckpt = {
-                    "epoch": epoch,
-                    "model": self.model.module.state_dict(),
-                    "discriminator": self.discriminator.module.state_dict(),
-                    "optimizer": self.optimizer.state_dict(),
-                    "optimizer_disc": self.optimizer_disc.state_dict(),
-                    "scheduler_G": scheduler_G.state_dict(),
-                    "scheduler_D": scheduler_D.state_dict(),
-                }
-                torch.save(ckpt, ckpt_path)
+                torch.save(self.model.module.state_dict(), path)
             scheduler_G.step()
             scheduler_D.step()
 
